@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+output/videos/*
+output/images/*
+output/posts/*
+!output/**/.gitkeep
+*.mp4
+*.mp3
+*.wav
+.DS_Store
