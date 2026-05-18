@@ -6,6 +6,14 @@ import { Telegraf, Markup } from 'telegraf';
 import { nanoid } from 'nanoid';
 import { interpretCommand, generateContentScript, generateContentPlan } from '../services/ai/claude.js';
 import { addContentJob, getQueueStats } from '../services/queue/index.js';
+import {
+  getBacklogStatus,
+  approveItem,
+  pauseScheduler,
+  resumeScheduler,
+  addToBacklog,
+} from '../scheduler/index.js';
+import { getAnalyticsStore } from '../workers/analytics-puller.js';
 import type { ContentRequest, ContentStyle, Platform } from '../types/index.js';
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
@@ -29,8 +37,13 @@ Commands:
 /thread <topic> — Create an X thread
 /plan <days> — Generate a content plan
 /status — Check queue status
-/approve — Approve pending content
+/approve <id> — Approve a flagged item
 /schedule <time> <description> — Schedule content
+/backlog — Show what's queued
+/pause — Stop autonomous posting
+/resume — Resume autonomous posting
+/digest — Weekly performance summary
+/idea <text> — Drop an idea into the backlog
 
 Or just describe what you want in plain English and I'll figure it out.`);
 });
@@ -140,6 +153,161 @@ bot.command('plan', async (ctx) => {
   planText += `\nSend /execute_plan to schedule all posts.`;
   ctx.reply(planText);
 });
+
+// ── Backlog Command ──
+bot.command('backlog', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+  const status = getBacklogStatus();
+
+  let msg = `📋 Backlog Status:
+Total items: ${status.total}
+Pending: ${status.pending}
+Posted: ${status.posted}
+Failed: ${status.failed}
+Awaiting approval: ${status.awaitingApproval}
+Scheduler: ${status.isPaused ? '⏸ Paused' : '▶️ Running'}`;
+
+  if (status.nextScheduled) {
+    const next = new Date(status.nextScheduled);
+    msg += `\nNext scheduled: ${next.toLocaleString()}`;
+  }
+
+  ctx.reply(msg);
+});
+
+// ── Approve Command ──
+bot.command('approve', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+  const itemId = ctx.message.text.replace('/approve', '').trim();
+  if (!itemId) return ctx.reply('Usage: /approve <id>');
+
+  const success = approveItem(itemId);
+  if (success) {
+    ctx.reply(`✅ Item ${itemId} approved and queued for posting.`);
+  } else {
+    ctx.reply(`❌ Could not approve item ${itemId}. It may not exist or is not awaiting approval.`);
+  }
+});
+
+// ── Pause Command ──
+bot.command('pause', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+  pauseScheduler();
+  ctx.reply('⏸ Autonomous posting paused. Use /resume to restart.');
+});
+
+// ── Resume Command ──
+bot.command('resume', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+  resumeScheduler();
+  ctx.reply('▶️ Autonomous posting resumed.');
+});
+
+// ── Digest Command — Weekly performance summary ──
+bot.command('digest', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+
+  const store = getAnalyticsStore();
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+  const recentMetrics = store.metrics.filter(
+    (m) => new Date(m.capturedAt) >= weekAgo,
+  );
+
+  if (recentMetrics.length === 0) {
+    return ctx.reply('📊 No analytics data from the past 7 days yet.');
+  }
+
+  // Aggregate latest metrics per post (take the most recent capture)
+  const latestByPost = new Map<string, typeof recentMetrics[0]>();
+  for (const m of recentMetrics) {
+    const existing = latestByPost.get(m.postId);
+    if (!existing || new Date(m.capturedAt) > new Date(existing.capturedAt)) {
+      latestByPost.set(m.postId, m);
+    }
+  }
+
+  const metrics = Array.from(latestByPost.values());
+  const totalViews = metrics.reduce((sum, m) => sum + m.views, 0);
+  const totalLikes = metrics.reduce((sum, m) => sum + m.likes, 0);
+  const totalComments = metrics.reduce((sum, m) => sum + m.comments, 0);
+  const totalShares = metrics.reduce((sum, m) => sum + m.shares, 0);
+
+  const topPost = metrics.sort((a, b) => b.views - a.views)[0];
+  const postRecord = store.posts.find((p) => p.id === topPost?.postId);
+
+  let msg = `📊 Weekly Digest (${metrics.length} posts):
+
+👀 Total views: ${totalViews.toLocaleString()}
+❤️ Total likes: ${totalLikes.toLocaleString()}
+💬 Total comments: ${totalComments.toLocaleString()}
+🔄 Total shares: ${totalShares.toLocaleString()}`;
+
+  if (topPost && postRecord) {
+    msg += `\n\n🏆 Top post: "${postRecord.hook}"
+   ${topPost.views.toLocaleString()} views on ${postRecord.platform}`;
+  }
+
+  const backlogStatus = getBacklogStatus();
+  msg += `\n\n📋 Backlog: ${backlogStatus.pending} pending, ${backlogStatus.awaitingApproval} awaiting approval`;
+
+  ctx.reply(msg);
+});
+
+// ── Idea Command — Drop an idea into the backlog ──
+bot.command('idea', async (ctx) => {
+  if (!isAuthorized(ctx.chat.id)) return;
+  const ideaText = ctx.message.text.replace('/idea', '').trim();
+  if (!ideaText) return ctx.reply('Usage: /idea <your content idea>');
+
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  const item = addToBacklog({
+    scheduledAt: tomorrow.toISOString(),
+    contentType: 'short_video',
+    platforms: ['youtube', 'x', 'instagram', 'tiktok'] as Platform[],
+    topic: ideaText,
+    hook: ideaText,
+    approvalRequired: true,
+  });
+
+  ctx.reply(`💡 Idea added to backlog!
+ID: ${item.id}
+Topic: "${ideaText}"
+Scheduled: ${tomorrow.toLocaleString()}
+Status: Pending (approval required)
+
+The scheduler will generate content and send it for your approval.`);
+});
+
+// ── Auto-alerts: Milestone notifications ──
+// Call this periodically (e.g., from the analytics puller) to check for milestones
+const notifiedMilestones = new Set<string>();
+
+export function checkViewMilestones(
+  postId: string,
+  views: number,
+  hook: string,
+  platform: string,
+): void {
+  const milestones = [
+    { threshold: 1_000_000, label: '1M' },
+    { threshold: 100_000, label: '100K' },
+    { threshold: 10_000, label: '10K' },
+  ];
+
+  for (const milestone of milestones) {
+    const key = `${postId}-${milestone.threshold}`;
+    if (views >= milestone.threshold && !notifiedMilestones.has(key)) {
+      notifiedMilestones.add(key);
+      const msg = `🎉 MILESTONE: "${hook}" just passed ${milestone.label} views on ${platform}! (${views.toLocaleString()} views)`;
+      bot.telegram.sendMessage(ALLOWED_CHAT, msg).catch((err) =>
+        console.error('[Telegram] Failed to send milestone alert:', err),
+      );
+      break; // Only notify for the highest unnotified milestone
+    }
+  }
+}
 
 // ── Natural Language Handler ──
 bot.on('text', async (ctx) => {
