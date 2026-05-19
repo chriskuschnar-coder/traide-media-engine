@@ -1,8 +1,12 @@
 import { generateContentScript, generateContentPlan, adaptForPlatform } from '../services/ai/claude.js';
-import { createDraft, getDraft, updateDraftStatus, updateDraftScript, getPendingDrafts, getDraftsForChat, deleteDraft, type Draft, type DraftStatus } from './drafts.js';
+import { createDraft, getDraft, updateDraftStatus, updateDraftScript, getPendingDrafts, getDraftsForChat, saveDraft, deleteDraft, type Draft, type DraftStatus } from './drafts.js';
 import { getRecentDraftIds, type ContextMessage } from './context.js';
+import { reviewContent, appendDisclaimer } from '../services/compliance/index.js';
 import type { ParsedAction } from './router.js';
-import type { ContentStyle } from '../types/index.js';
+import type { ContentStyle, Platform } from '../types/index.js';
+
+// Platform imports are lazy — loaded only when actually publishing
+// This prevents crashes when API keys aren't configured yet
 
 // Scheduler state (simple in-memory flag, would be Redis in production)
 let postingPaused = false;
@@ -281,8 +285,7 @@ async function handleSchedule(
   const draft = result;
   draft.scheduledFor = when || 'next available slot';
   draft.status = 'scheduled';
-  const { saveDraft: save } = await import('./drafts.js');
-  await save(draft);
+  await saveDraft(draft);
 
   return { reply: `${draft.id} scheduled for ${draft.scheduledFor}. Will ping before it posts.`, draftIds: [draft.id] };
 }
@@ -299,8 +302,123 @@ async function handlePublishNow(
     return { reply: `Which one?\n${formatDraftList(pending)}`, draftIds: pending.map(d => d.id) };
   }
 
-  await updateDraftStatus(result.id, 'published');
-  return { reply: `${result.id} sent to distribution queue. Will report back with links.`, draftIds: [result.id] };
+  const draft = result;
+  if (!draft.script) return { reply: `Draft ${draft.id} has no script. Revise first.`, draftIds: [draft.id] };
+
+  // Run compliance check
+  const complianceResult = await reviewContent(draft.script.body + ' ' + draft.script.caption);
+  if (!complianceResult.approved) {
+    return {
+      reply: `⚠️ Compliance blocked ${draft.id}:\n${complianceResult.issues.map(i => `• ${i}`).join('\n')}${complianceResult.suggestedRevision ? `\n\nSuggested fix: ${complianceResult.suggestedRevision}` : ''}`,
+      draftIds: [draft.id],
+    };
+  }
+
+  const caption = appendDisclaimer(draft.script.caption + '\n\n' + draft.script.hashtags.map(h => `#${h}`).join(' '));
+  const enabledPlatforms = (process.env.ENABLED_PLATFORMS || 'youtube').split(',').map(p => p.trim());
+  const targetPlatforms = draft.platforms.filter(p => enabledPlatforms.includes(p));
+
+  if (targetPlatforms.length === 0) {
+    return { reply: `No enabled platforms match this draft. Enabled: ${enabledPlatforms.join(', ')}. Draft targets: ${draft.platforms.join(', ')}.`, draftIds: [draft.id] };
+  }
+
+  const results: string[] = [];
+  const publishedResults: { platform: string; url?: string; id?: string }[] = [];
+
+  for (const platform of targetPlatforms) {
+    try {
+      const postResult = await publishToPlatform(platform, draft, caption);
+      results.push(`${platform}: ${postResult.url || postResult.id || 'posted'}`);
+      publishedResults.push({ platform, ...postResult });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      results.push(`${platform}: failed — ${msg.slice(0, 100)}`);
+    }
+  }
+
+  draft.status = 'published';
+  draft.publishedResults = publishedResults;
+  await saveDraft(draft);
+
+  return {
+    reply: `Published ${draft.id}:\n${results.map(r => `• ${r}`).join('\n')}`,
+    draftIds: [draft.id],
+  };
+}
+
+async function publishToPlatform(
+  platform: string,
+  draft: Draft,
+  caption: string
+): Promise<{ url?: string; id?: string }> {
+  const videoAsset = draft.assets?.find(a => a.type === 'video');
+  const imageAsset = draft.assets?.find(a => a.type === 'image');
+
+  switch (platform) {
+    case 'x': {
+      const { postTweet, postThread } = await import('../platforms/x/index.js');
+      if (draft.type === 'thread' && draft.script) {
+        const tweets = draft.script.body.split('\n\n').filter(t => t.trim());
+        const res = await postThread({ tweets, mediaPath: videoAsset?.path });
+        return { url: res.url, id: res.ids[0] };
+      }
+      const text = caption.slice(0, 280);
+      const res = await postTweet({ text, mediaPath: videoAsset?.path || imageAsset?.path });
+      return { url: res.url, id: res.id };
+    }
+
+    case 'youtube': {
+      const { uploadShort } = await import('../platforms/youtube/index.js');
+      if (!videoAsset) return { id: 'skipped — no video asset' };
+      const res = await uploadShort({
+        videoPath: videoAsset.path,
+        title: (draft.script?.hook || draft.topic).slice(0, 100),
+        description: caption,
+        tags: draft.script?.hashtags || ['traide', 'trading', 'ai'],
+      });
+      return { url: res.url, id: res.id };
+    }
+
+    case 'instagram': {
+      const { postReel, postImage } = await import('../platforms/instagram/index.js');
+      if (videoAsset) {
+        const res = await postReel({ videoUrl: videoAsset.path, caption });
+        return { url: res.url, id: res.id };
+      }
+      if (imageAsset) {
+        const res = await postImage({ imageUrl: imageAsset.path, caption });
+        return { id: res.id };
+      }
+      return { id: 'skipped — no media' };
+    }
+
+    case 'tiktok': {
+      const { postVideo } = await import('../platforms/tiktok/index.js');
+      if (!videoAsset) return { id: 'skipped — no video' };
+      const res = await postVideo({ videoPath: videoAsset.path, title: caption.slice(0, 150) });
+      return { id: res.id };
+    }
+
+    case 'facebook': {
+      const { postToPage } = await import('../platforms/facebook/index.js');
+      const res = await postToPage({ message: caption, link: 'https://traide.live' });
+      return { url: res.url, id: res.id };
+    }
+
+    case 'telegram': {
+      const { postToChannel } = await import('../platforms/telegram/index.js');
+      const res = await postToChannel({
+        text: caption,
+        videoPath: videoAsset?.path,
+        imagePath: imageAsset?.path,
+        buttons: [{ text: 'Try Traide.live', url: 'https://traide.live' }],
+      });
+      return { id: String(res.messageId) };
+    }
+
+    default:
+      return { id: `unsupported platform: ${platform}` };
+  }
 }
 
 async function handleShowDrafts(chatId: string, params: Record<string, any>): Promise<{ reply: string; draftIds: string[] }> {

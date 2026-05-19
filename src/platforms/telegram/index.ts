@@ -3,7 +3,10 @@
 import { Telegraf } from 'telegraf';
 import fs from 'fs';
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+function getBot() {
+  if (!process.env.TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN not set');
+  return new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+}
 
 export async function postToChannel(params: {
   text: string;
@@ -11,7 +14,9 @@ export async function postToChannel(params: {
   videoPath?: string;
   buttons?: { text: string; url: string }[];
 }): Promise<{ messageId: number }> {
-  const channelId = process.env.TELEGRAM_CHANNEL_ID!;
+  const bot = getBot();
+  const channelId = process.env.TELEGRAM_CHANNEL_ID;
+  if (!channelId) throw new Error('TELEGRAM_CHANNEL_ID not set — configure it in .env to post to a channel');
 
   const replyMarkup = params.buttons ? {
     inline_keyboard: [params.buttons.map(b => ({ text: b.text, url: b.url }))],

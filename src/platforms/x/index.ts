@@ -3,17 +3,21 @@
 import { TwitterApi } from 'twitter-api-v2';
 import fs from 'fs';
 
-const client = new TwitterApi({
-  appKey: process.env.X_API_KEY!,
-  appSecret: process.env.X_API_SECRET!,
-  accessToken: process.env.X_ACCESS_TOKEN!,
-  accessSecret: process.env.X_ACCESS_SECRET!,
-});
+function getClient() {
+  if (!process.env.X_API_KEY) throw new Error('X_API_KEY not set — configure X/Twitter credentials in .env');
+  return new TwitterApi({
+    appKey: process.env.X_API_KEY,
+    appSecret: process.env.X_API_SECRET!,
+    accessToken: process.env.X_ACCESS_TOKEN!,
+    accessSecret: process.env.X_ACCESS_SECRET!,
+  });
+}
 
 export async function postTweet(params: {
   text: string;
   mediaPath?: string;
 }): Promise<{ id: string; url: string }> {
+  const client = getClient();
   let mediaId: string | undefined;
 
   if (params.mediaPath) {
@@ -35,6 +39,7 @@ export async function postThread(params: {
   tweets: string[];
   mediaPath?: string;  // Attach to first tweet
 }): Promise<{ ids: string[]; url: string }> {
+  const client = getClient();
   const ids: string[] = [];
   let lastTweetId: string | undefined;
 

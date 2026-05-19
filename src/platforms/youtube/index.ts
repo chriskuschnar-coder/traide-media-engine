@@ -4,13 +4,15 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import type { ContentAsset } from '../../types/index.js';
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.YOUTUBE_CLIENT_ID,
-  process.env.YOUTUBE_CLIENT_SECRET,
-);
-oauth2Client.setCredentials({ refresh_token: process.env.YOUTUBE_REFRESH_TOKEN });
-
-const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+function getYouTube() {
+  if (!process.env.YOUTUBE_CLIENT_ID) throw new Error('YOUTUBE_CLIENT_ID not set — configure YouTube credentials in .env');
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.YOUTUBE_CLIENT_ID,
+    process.env.YOUTUBE_CLIENT_SECRET,
+  );
+  oauth2Client.setCredentials({ refresh_token: process.env.YOUTUBE_REFRESH_TOKEN });
+  return google.youtube({ version: 'v3', auth: oauth2Client });
+}
 
 export async function uploadShort(params: {
   videoPath: string;
@@ -18,6 +20,7 @@ export async function uploadShort(params: {
   description: string;
   tags: string[];
 }): Promise<{ id: string; url: string }> {
+  const youtube = getYouTube();
   const res = await youtube.videos.insert({
     part: ['snippet', 'status'],
     requestBody: {
